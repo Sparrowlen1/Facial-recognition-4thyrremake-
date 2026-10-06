@@ -1,0 +1,297 @@
+from flask import Flask, render_template, request, redirect, url_for, session
+import cv2
+import sqlite3
+import os
+import re
+import json
+from datetime import datetime
+import pandas as pd
+import face_recognition
+
+app = Flask(__name__)
+app.secret_key = 'your_secret_key'  # Required for session management
+
+# Ensure necessary folders exist
+if not os.path.exists('student_images'):
+    os.makedirs('student_images')
+if not os.path.exists('static/student_images'):
+    os.makedirs('static/student_images', exist_ok=True)
+
+
+# Database setup
+def init_db():
+    conn = sqlite3.connect('attendance.db')
+    c = conn.cursor()
+    c.execute('''CREATE TABLE IF NOT EXISTS users
+                 (id INTEGER PRIMARY KEY AUTOINCREMENT,
+                  username TEXT, password TEXT, role TEXT)''')
+    c.execute('''CREATE TABLE IF NOT EXISTS students
+                 (id INTEGER PRIMARY KEY AUTOINCREMENT,
+                  name TEXT, reg_number TEXT, year TEXT, course TEXT,
+                  face_image TEXT, face_encoding TEXT)''')
+    c.execute('''CREATE TABLE IF NOT EXISTS attendance
+                 (id INTEGER PRIMARY KEY AUTOINCREMENT,
+                  student_id INTEGER, date TEXT, time TEXT)''')
+    conn.commit()
+    conn.close()
+
+
+init_db()
+
+# Face recognition setup
+face_cascade = cv2.CascadeClassifier(
+    cv2.data.haarcascades + 'haarcascade_frontalface_default.xml'
+)
+
+
+def capture_face(reg_number):
+    cap = cv2.VideoCapture(0)
+    if not cap.isOpened():
+        print("Error: Could not open camera.")
+        return None
+
+    ret, frame = cap.read()
+    if not ret:
+        print("Error: Could not capture frame.")
+        cap.release()
+        return None
+
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    faces = face_cascade.detectMultiScale(
+        gray, scaleFactor=1.3, minNeighbors=5, minSize=(50, 50)
+    )
+
+    if len(faces) > 0:
+        (x, y, w, h) = faces[0]
+        face = frame[y:y + h, x:x + w]
+
+        # Sanitize reg_number so it can safely be used as a filename.
+        # Anything that isn't a letter, digit, dash or underscore becomes "_".
+        safe_reg = re.sub(r'[^A-Za-z0-9_-]', '_', reg_number)
+
+        face_filename = f"student_images/{safe_reg}.jpg"
+        save_path = f"static/{face_filename}"
+
+        # Ensure the target directory exists
+        os.makedirs(os.path.dirname(save_path), exist_ok=True)
+
+        # cv2.imwrite returns True on success, False on failure
+        success = cv2.imwrite(save_path, face)
+        cap.release()
+
+        if not success:
+            print(f"Error: cv2.imwrite failed for {save_path}")
+            return None
+
+        print(f"Face captured and saved as {save_path}")
+        return face_filename
+    else:
+        print("No face detected.")
+        cap.release()
+        return None
+
+
+@app.route('/')
+def index():
+    return redirect(url_for('signup'))
+
+
+@app.route('/signup', methods=['GET', 'POST'])
+def signup():
+    if request.method == 'POST':
+        username = request.form['username']
+        password = request.form['password']
+        role = request.form['role']  # 'student' or 'admin'
+        conn = sqlite3.connect('attendance.db')
+        c = conn.cursor()
+        c.execute(
+            "INSERT INTO users (username, password, role) VALUES (?, ?, ?)",
+            (username, password, role)
+        )
+        conn.commit()
+        conn.close()
+        return redirect(url_for('login'))
+    return render_template('signup.html')
+
+
+@app.route('/login', methods=['GET', 'POST'])
+def login():
+    if request.method == 'POST':
+        username = request.form['username']
+        password = request.form['password']
+        conn = sqlite3.connect('attendance.db')
+        c = conn.cursor()
+        c.execute(
+            "SELECT * FROM users WHERE username = ? AND password = ?",
+            (username, password)
+        )
+        user = c.fetchone()
+        conn.close()
+        if user:
+            session['username'] = user[1]
+            session['role'] = user[3]  # 'student' or 'admin'
+            if user[3] == 'student':
+                return redirect(url_for('student'))
+            else:
+                return redirect(url_for('admin'))
+        else:
+            return "Invalid credentials"
+    return render_template('login.html')
+
+
+@app.route('/student', methods=['GET', 'POST'])
+def student():
+    if 'username' not in session or session['role'] != 'student':
+        return redirect(url_for('login'))
+
+    if request.method == 'POST':
+        name = request.form['name']
+        reg_number = request.form['reg_number']
+        year = request.form['year']
+        course = request.form['course']
+
+        # Check if the registration number already exists
+        conn = sqlite3.connect('attendance.db')
+        c = conn.cursor()
+        c.execute("SELECT * FROM students WHERE reg_number = ?", (reg_number,))
+        existing_student = c.fetchone()
+        if existing_student:
+            conn.close()
+            return "A student with this registration number already exists."
+
+        # Capture the face image
+        face_filename = capture_face(reg_number)
+        if face_filename:
+            # Load the captured image and generate face encoding
+            image = face_recognition.load_image_file(f"static/{face_filename}")
+            face_encodings = face_recognition.face_encodings(image)
+
+            if len(face_encodings) == 0:
+                conn.close()
+                return "No face detected in the captured image."
+
+            # Convert numpy array to a JSON-serializable list
+            face_encoding = face_encodings[0].tolist()
+
+            # Insert student details and face encoding into the database
+            c.execute(
+                "INSERT INTO students "
+                "(name, reg_number, year, course, face_image, face_encoding) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (name, reg_number, year, course,
+                 face_filename, json.dumps(face_encoding))
+            )
+            conn.commit()
+            conn.close()
+            return "Student registered successfully"
+        else:
+            conn.close()
+            return ("Face capture failed. "
+                    "Ensure your face is clearly visible and well-lit.")
+
+    return render_template('student.html')
+
+
+@app.route('/mark_attendance', methods=['POST'])
+def mark_attendance():
+    if 'username' not in session or session['role'] != 'student':
+        return redirect(url_for('login'))
+
+    # Capture a frame from the camera
+    cap = cv2.VideoCapture(0)
+    ret, frame = cap.read()
+    cap.release()
+
+    if not ret:
+        return "Error: Could not capture frame."
+
+    # Detect faces in the frame
+    face_locations = face_recognition.face_locations(frame)
+    if len(face_locations) == 0:
+        return "No face detected."
+
+    # Compute face encoding for the detected face
+    face_encodings = face_recognition.face_encodings(frame, face_locations)
+    if len(face_encodings) == 0:
+        return "Could not generate face encoding."
+
+    unknown_face_encoding = face_encodings[0]
+
+    # Retrieve all registered students' face encodings from the database
+    conn = sqlite3.connect('attendance.db')
+    c = conn.cursor()
+    c.execute("SELECT id, name, reg_number, face_encoding FROM students")
+    registered_students = c.fetchall()
+    conn.close()
+
+    # Compare the unknown face encoding with registered encodings
+    for student_id, name, reg_number, face_encoding_str in registered_students:
+        if not face_encoding_str:
+            continue
+        registered_encoding = json.loads(face_encoding_str)
+        matches = face_recognition.compare_faces(
+            [registered_encoding], unknown_face_encoding, tolerance=0.6
+        )
+
+        if any(matches):
+            # Mark attendance for the matched student
+            now = datetime.now()
+            date = now.strftime("%Y-%m-%d")
+            time = now.strftime("%H:%M:%S")
+
+            conn = sqlite3.connect('attendance.db')
+            c = conn.cursor()
+            c.execute(
+                "INSERT INTO attendance (student_id, date, time) "
+                "VALUES (?, ?, ?)",
+                (student_id, date, time)
+            )
+            conn.commit()
+            conn.close()
+
+            # Save to Excel
+            data = {
+                "Student ID": [student_id],
+                "Name": [name],
+                "Registration Number": [reg_number],
+                "Date": [date],
+                "Time": [time],
+            }
+            df = pd.DataFrame(data)
+            if not os.path.exists('attendance.xlsx'):
+                df.to_excel('attendance.xlsx', index=False)
+            else:
+                existing_df = pd.read_excel('attendance.xlsx')
+                updated_df = pd.concat([existing_df, df], ignore_index=True)
+                updated_df.to_excel('attendance.xlsx', index=False)
+
+            return f"Attendance marked for {name} ({reg_number})"
+
+    return "No matching face found."
+
+
+@app.route('/admin')
+def admin():
+    if 'username' not in session or session['role'] != 'admin':
+        return redirect(url_for('login'))
+
+    conn = sqlite3.connect('attendance.db')
+    c = conn.cursor()
+    c.execute('''SELECT students.name, students.reg_number, students.face_image,
+                        attendance.date, attendance.time
+                 FROM attendance
+                 INNER JOIN students ON attendance.student_id = students.id''')
+    attendance_records = c.fetchall()
+    conn.close()
+    return render_template('admin.html', attendance_records=attendance_records)
+
+
+@app.route('/logout')
+def logout():
+    session.pop('username', None)
+    session.pop('role', None)
+    return redirect(url_for('login'))
+
+
+if __name__ == '__main__':
+    app.run(debug=True)
